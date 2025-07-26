@@ -5,13 +5,17 @@ import asyncio
 import os
 import uuid
 import pygame
+import threading
+import customtkinter as ctk
+import tkinter as tk
 
-# Configura a API do Gemini
-genai.configure(api_key="")  # <--- coloca tua chave aqui
+# ====================
+# CONFIGURAÇÕES
+# ====================
+genai.configure(api_key="")
 
-# Usa o modelo Gemini 1.5 Flash
 model = genai.GenerativeModel(
-    model_name="models/gemini-2.0-flash",
+    model_name="models/gemini-2.5-flash",
     system_instruction="""
 Você é bem-humorada, direta e sarcástica.
 Fala de forma informal, como se fosse um amigo zoando.
@@ -20,10 +24,16 @@ Não escreva rostinhos, corações ou qualquer símbolo visual. Só texto puro.
 """
 )
 
-# Inicializa o pygame
 pygame.mixer.init()
 
-# Fala com voz neural (sem abrir player)
+# ====================
+# VARIÁVEL DE CONTROLE
+# ====================
+escutando = False
+
+# ====================
+# FUNÇÃO DE FALAR
+# ====================
 async def speak(texto):
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
     communicate = edge_tts.Communicate(texto, voice="pt-BR-FranciscaNeural")
@@ -32,15 +42,17 @@ async def speak(texto):
     pygame.mixer.music.play()
     while pygame.mixer.music.get_busy():
         await asyncio.sleep(0.1)
-    pygame.mixer.music.unload()  # <- libera o arquivo
+    pygame.mixer.music.unload()
     os.remove(nome_arquivo)
 
-# Ouve o microfone
+# ====================
+# FUNÇÃO OUVIR MICROFONE
+# ====================
 def ouvir_microfone():
     recognizer = sr.Recognizer()
     with sr.Microphone() as source:
         print("Você: (fala aí)")
-        audio = recognizer.listen(source)
+        audio = recognizer.listen(source, timeout=None, phrase_time_limit=None)
     try:
         frase = recognizer.recognize_google(audio, language='pt-BR')
         print("Você disse:", frase)
@@ -52,12 +64,109 @@ def ouvir_microfone():
         print("Erro na API de reconhecimento")
         return None
 
-# Loop principal
-while True:
-    entrada = ouvir_microfone()
-    if entrada:
-        if entrada.lower() in ["sair", "tchau", "fechar"]:
-            asyncio.run(speak("Até logo! Foi bom falar com você."))
-            break
-        resposta = model.generate_content(entrada)
-        asyncio.run(speak(resposta.text))
+# ====================
+# LOOP DA IA
+# ====================
+def executar_ia():
+    global escutando
+    try:
+        while escutando:
+            entrada = ouvir_microfone()
+            if not escutando:  # Se parar durante a escuta
+                break
+            if entrada:
+                resposta = model.generate_content(entrada)
+                asyncio.run(speak(resposta.text))
+            else:
+                asyncio.run(speak("Não entendi, fala de novo aí."))
+    except Exception as e:
+        print(e)
+
+# ====================
+# THREAD CONTROLADORA
+# ====================
+def rodar_ou_parar():
+    global escutando
+    if not escutando:
+        escutando = True
+        atualizar_estado()
+        t = threading.Thread(target=executar_ia)
+        t.start()
+    else:
+        escutando = False
+        atualizar_estado()
+
+# ====================
+# ATUALIZAÇÃO VISUAL
+# ====================
+def atualizar_estado():
+    if escutando:
+        botao.configure(
+            text="Parar",
+            fg_color="#FF4040",
+            hover_color="#D93636"
+        )
+        animar_circulo()
+    else:
+        botao.configure(
+            text="Falar com a IA",
+            fg_color="#00FF7F",
+            hover_color="#00CC66"
+        )
+        canvas_circulo.itemconfig(circulo, fill="#303030")
+
+# ====================
+# ANIMAÇÃO DO CÍRCULO
+# ====================
+def animar_circulo():
+    if escutando:
+        cor_atual = canvas_circulo.itemcget(circulo, "fill")
+        nova_cor = "#00FF7F" if cor_atual == "#303030" else "#303030"
+        canvas_circulo.itemconfig(circulo, fill=nova_cor)
+        janela.after(500, animar_circulo)  # Pisca a cada 500ms
+
+# ====================
+# INTERFACE MODERNA
+# ====================
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+
+janela = ctk.CTk()
+janela.title("IA do Mateus")
+janela.geometry("500x400")
+janela.resizable(False, False)
+
+# Label título
+titulo = ctk.CTkLabel(
+    janela,
+    text="IA do Mateus",
+    font=("Arial Black", 28)
+)
+titulo.pack(pady=30)
+
+# Círculo de status
+frame_canvas = ctk.CTkFrame(janela, fg_color="transparent")
+frame_canvas.pack(pady=10)
+
+canvas_circulo = tk.Canvas(frame_canvas, width=40, height=40, bg="#242424", highlightthickness=0)
+canvas_circulo.pack()
+
+circulo = canvas_circulo.create_oval(5, 5, 35, 35, fill="#303030", outline="")
+
+# Botão principal
+botao = ctk.CTkButton(
+    janela,
+    text="Falar com a IA",
+    font=("Arial", 18, "bold"),
+    fg_color="#00FF7F",
+    hover_color="#00CC66",
+    text_color="black",
+    width=200,
+    height=50,
+    corner_radius=10,
+    command=rodar_ou_parar
+)
+botao.pack(pady=30)
+
+# Rodar janela
+janela.mainloop()
