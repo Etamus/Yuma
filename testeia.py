@@ -22,11 +22,12 @@ model = genai.GenerativeModel(
 Seu nome é Yuma e você é bem-humorada, direta e sarcástica.
 Fala de forma informal, como se fosse um amigo zoando.
 Responda sempre em português do Brasil. Nunca use emojis nas respostas.
-Se a entrada não fizer sentido, responda com sarcasmo como se não tivesse entendido"
+Se a entrada não fizer sentido, responda com sarcasmo como se não tivesse entendido.
 """
 )
 
 pygame.mixer.init()
+
 escutando = False
 parar_tudo = False
 microfone_index = 0
@@ -35,6 +36,10 @@ microfone_index = 0
 # ====================
 # FALA
 # ====================
+def speak_thread(texto):
+    asyncio.run(speak(texto))
+
+
 async def speak(texto):
     global parar_tudo
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
@@ -69,12 +74,10 @@ def listar_microfones():
 
     for i in range(pa.get_device_count()):
         info = pa.get_device_info_by_index(i)
-
         nome = info["name"].lower()
         entrada = info["maxInputChannels"]
         saida = info["maxOutputChannels"]
 
-        # Critérios para aceitar como microfone:
         if entrada > 0:
             if (
                 ("mic" in nome) or 
@@ -108,12 +111,11 @@ def definir_microfone(index):
 # ====================
 def ouvir_microfone():
     recognizer = sr.Recognizer()
-
     try:
         with sr.Microphone(device_index=microfone_index) as source:
             print(f"[INFO] Ouvindo pelo microfone: {source.device_index}")
-            recognizer.adjust_for_ambient_noise(source, duration=0.8)
-            audio = recognizer.listen(source, timeout=None, phrase_time_limit=None)
+            recognizer.adjust_for_ambient_noise(source, duration=0.6)
+            audio = recognizer.listen(source, timeout=None, phrase_time_limit=5)
     except Exception as e:
         print(f"[ERRO] Problema ao acessar o microfone: {e}")
         resposta_label.configure(text=f"Erro no microfone: {e}")
@@ -124,16 +126,16 @@ def ouvir_microfone():
         print(f"[USUÁRIO] {frase}")
         return frase
     except sr.UnknownValueError:
-        print("[ERRO] Não entendi o que você disse (UnknownValueError).")
-        resposta_label.configure(text="Não foi possível entender. Fale novamente.")
+        print("[ERRO] Não entendi (UnknownValueError).")
+        resposta_label.configure(text="Não entendi, fala de novo aí.")
         return None
     except sr.RequestError as e:
-        print(f"[ERRO] Erro no serviço de reconhecimento de voz: {e}")
-        resposta_label.configure(text="Erro na API de reconhecimento.")
+        print(f"[ERRO] Erro na API de reconhecimento: {e}")
+        resposta_label.configure(text="Erro na API de voz.")
         return None
     except Exception as e:
         print(f"[ERRO] Erro inesperado: {e}")
-        resposta_label.configure(text=f"Erro inesperado: {e}")
+        resposta_label.configure(text=f"Erro: {e}")
         return None
 
 
@@ -150,30 +152,33 @@ Gere uma frase divertida, sarcástica ou curiosa para puxar papo, como se fosse 
         return resposta
     except Exception as e:
         print(f"[ERROR] Erro ao gerar frase proativa: {e}")
-        return "Tá muito silêncio aí... Fala comigo pô!"
+        return "Tá muito silêncio aí..."
 
 
 # ====================
-# IA LOOP
+# IA LOOP COM PARALELISMO
 # ====================
 def executar_ia():
     global escutando, parar_tudo
     try:
-        asyncio.run(speak("Como vai?."))
+        threading.Thread(target=speak_thread, args=("Como vai?",), daemon=True).start()
+
         while escutando and not parar_tudo:
             entrada = ouvir_microfone()
             if not escutando or parar_tudo:
                 break
+
             if entrada:
                 resposta = model.generate_content(entrada).text
                 resposta_label.configure(text=resposta)
                 print(f"[YUMA] {resposta}")
-                asyncio.run(speak(resposta))
+                threading.Thread(target=speak_thread, args=(resposta,), daemon=True).start()
             else:
                 resposta = gerar_frase_proativa()
                 resposta_label.configure(text=resposta)
                 print(f"[YUMA] {resposta}")
-                asyncio.run(speak(resposta))
+                threading.Thread(target=speak_thread, args=(resposta,), daemon=True).start()
+
     except Exception as e:
         print(f"[ERROR] {e}")
         resposta_label.configure(text=f"Erro: {e}")
@@ -196,7 +201,7 @@ def acionar():
         escutando = False
         parar_tudo = True
         resposta_label.configure(text="Parado.")
-        asyncio.run(speak("Beleza, parei de ouvir."))
+        threading.Thread(target=speak_thread, args=("Até mais!",), daemon=True).start()
         print("[INFO] IA Parada")
         canvas.coords(circulo, cx-r0, cy-r0, cx+r0, cy+r0)
         atualizar_botao_estado("falar")
