@@ -13,11 +13,12 @@ from collections import deque
 import time
 import audioop
 import sys
+from queue import Queue, Empty
+from threading import Event
 
 # ====================
 # CONFIGURAÇÃO DA IA
 # ====================
-# Lembre-se de usar sua própria chave da API do Google Gemini
 genai.configure(api_key="")
 
 PERSONALIDADES = {
@@ -51,45 +52,28 @@ Você não responde diretamente a menos que seja chamada. Não use emojis ou car
 """
 }
 
-# --- Constantes de Áudio para Interrupção ---
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
+# --- Constantes de Áudio e Variáveis Globais ---
+CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 16000
 INTERRUPTION_THRESHOLD = 800
-
-# Variáveis globais
-model = None
-pygame.mixer.init()
-pygame.mixer.set_num_channels(1)
-
-escutando = False
-parar_tudo = False
-microfone_index = 0
-voz_selecionada = "pt-BR-FranciscaNeural"
-volume_atual = 1
-persona_selecionada = "Padrão"
-
-memoria_contexto = deque(maxlen=6)
-ultima_atividade = 0
-falando = False
-interrompida = False
+model, escutando, parar_tudo, microfone_index, voz_selecionada, volume_atual, persona_selecionada = None, False, False, 0, "pt-BR-FranciscaNeural", 1, "Padrão"
+memoria_contexto, ultima_atividade, falando, interrompida = deque(maxlen=6), 0, False, False
+audio_queue = Queue()
+pode_ouvir_event = Event()
 
 # ====================
 # CLASSE PARA REDIRECIONAR O CONSOLE PARA A GUI
 # ====================
 class ConsoleRedirector:
-    def __init__(self, widget):
-        self.widget = widget
-
+    def __init__(self, widget): self.widget = widget
     def write(self, text):
-        self.widget.configure(state="normal")
-        self.widget.insert("end", text)
-        self.widget.see("end")
-        self.widget.configure(state="disabled")
-
-    def flush(self):
-        pass
+        try:
+            if self.widget.winfo_exists():
+                self.widget.configure(state="normal")
+                self.widget.insert("end", text)
+                self.widget.see("end")
+                self.widget.configure(state="disabled")
+        except: pass
+    def flush(self): pass
 
 # ====================
 # FUNÇÕES DE CONTROLE E UTILIDADE
@@ -102,10 +86,8 @@ def definir_personalidade(nome_persona):
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=instrucao)
         memoria_contexto.clear()
         print(f"[INFO] Personalidade alterada para: {nome_persona}\n")
-        if nome_persona == "Ambiente":
-            print("Modo Ambiente. Ouvindo passivamente...\n")
-    except Exception as e:
-        print(f"[ERRO] Falha ao definir personalidade: {e}\n")
+        if nome_persona == "Ambiente": print("Modo Ambiente. Ouvindo passivamente...\n")
+    except Exception as e: print(f"[ERRO] Falha ao definir personalidade: {e}\n")
 
 def definir_microfone(index):
     global microfone_index
@@ -120,7 +102,7 @@ def definir_voz(voz_nome):
 def definir_volume(valor):
     global volume_atual
     volume_atual = float(valor) / 100
-    if pygame.mixer.music.get_busy():
+    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
         pygame.mixer.music.set_volume(volume_atual)
 
 def listar_microfones():
@@ -141,6 +123,10 @@ def listar_microfones():
 # FALA (TTS)
 # ====================
 def speak_thread(texto):
+    # <<< CORREÇÃO APLICADA AQUI >>>
+    # Garante que o mixer de áudio esteja inicializado nesta thread antes de usá-lo.
+    pygame.mixer.init()
+    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(speak(texto))
@@ -148,26 +134,25 @@ def speak_thread(texto):
 
 async def speak(texto):
     global falando, interrompida
+    if not pygame.mixer.get_init(): return
     falando = True
     interrompida = False
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
     try:
         communicate = edge_tts.Communicate(texto, voice=voz_selecionada)
         await communicate.save(nome_arquivo)
-        if parar_tudo: return
+        if parar_tudo or not pygame.mixer.get_init(): return
         pygame.mixer.music.load(nome_arquivo)
         pygame.mixer.music.set_volume(volume_atual)
         pygame.mixer.music.play()
-        # Pequena pausa para o som começar antes de monitorar interrupção
         await asyncio.sleep(0.2) 
-        while pygame.mixer.music.get_busy():
+        while pygame.mixer.get_init() and pygame.mixer.music.get_busy():
             if parar_tudo or interrompida:
                 pygame.mixer.music.stop()
                 print("[INFO] Áudio interrompido pelo usuário.\n")
                 break
             await asyncio.sleep(0.05)
-    except Exception as e:
-        print(f"[ERRO] Falha ao gerar ou tocar áudio: {e}\n")
+    except Exception as e: print(f"[ERRO] Falha ao gerar ou tocar áudio: {e}\n")
     finally:
         falando = False
         if pygame.mixer.get_init(): pygame.mixer.music.unload()
@@ -178,44 +163,6 @@ async def speak(texto):
 # ====================
 # LÓGICA DE ESCUTA
 # ====================
-def ouvir_microfone():
-    global falando, interrompida, persona_selecionada
-    recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 1.5
-    recognizer.dynamic_energy_threshold = False
-    recognizer.energy_threshold = 400
-
-    if falando:
-        pa = pyaudio.PyAudio()
-        stream = None
-        try:
-            stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
-                             frames_per_buffer=CHUNK, input_device_index=microfone_index)
-            while falando and not interrompida and escutando:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                rms = audioop.rms(data, 2)
-                if rms > INTERRUPTION_THRESHOLD:
-                    print(f"[INTERRUPÇÃO] Detectada! Nível: {rms}\n")
-                    interrompida = True
-            return
-        except Exception: return None
-        finally:
-            if stream and stream.is_active(): stream.stop_stream()
-            if stream: stream.close()
-            pa.terminate()
-    else:
-        timeout = 15 if persona_selecionada == "Ambiente" else None
-        try:
-            with sr.Microphone(device_index=microfone_index, sample_rate=RATE) as source:
-                if persona_selecionada != "Ambiente": print("[INFO] Aguardando comando...\n")
-                else: print("[INFO] Modo Ambiente: Ouvindo passivamente...\n")
-                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=10)
-                return _reconhecer_audio(recognizer, audio)
-        except sr.WaitTimeoutError: return "TIMEOUT_AMBIENTE"
-        except Exception as e:
-            print(f"[ERRO] Falha na escuta normal: {e}\n")
-            return None
-
 def _reconhecer_audio(recognizer, audio_data):
     global ultima_atividade
     try:
@@ -228,20 +175,70 @@ def _reconhecer_audio(recognizer, audio_data):
         print(f"[ERRO] API de reconhecimento indisponível: {e}\n")
         return None
 
+def thread_ouvinte():
+    global escutando, parar_tudo, persona_selecionada
+    recognizer = sr.Recognizer()
+    recognizer.pause_threshold = 1.5
+    recognizer.dynamic_energy_threshold = False
+    recognizer.energy_threshold = 400
+    
+    while escutando and not parar_tudo:
+        pode_ouvir_event.wait()
+        if not escutando: break
+        try:
+            with sr.Microphone(device_index=microfone_index, sample_rate=RATE) as source:
+                timeout = 15 if persona_selecionada == "Ambiente" else None
+                if persona_selecionada != "Ambiente": print("[INFO] Aguardando comando...\n")
+                else: print("[INFO] Modo Ambiente: Ouvindo passivamente...\n")
+                
+                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=10)
+                pode_ouvir_event.clear()
+                
+                frase = _reconhecer_audio(recognizer, audio)
+                if frase:
+                    audio_queue.put(frase)
+                else:
+                    pode_ouvir_event.set()
+        except sr.WaitTimeoutError:
+            pode_ouvir_event.clear()
+            if persona_selecionada == "Ambiente":
+                audio_queue.put("TIMEOUT_AMBIENTE")
+            else:
+                pode_ouvir_event.set()
+        except Exception as e:
+            print(f"[ERRO] Falha na thread do ouvinte: {e}\n")
+            pode_ouvir_event.set()
+            time.sleep(1)
+
+def monitorar_interrupcao():
+    global interrompida
+    pa = pyaudio.PyAudio()
+    stream = None
+    try:
+        stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
+                         frames_per_buffer=CHUNK, input_device_index=microfone_index)
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        rms = audioop.rms(data, 2)
+        if rms > INTERRUPTION_THRESHOLD:
+            print(f"[INTERRUPÇÃO] Detectada! Nível: {rms}\n")
+            interrompida = True
+    except Exception: pass
+    finally:
+        if stream and stream.is_active(): stream.stop_stream()
+        if stream: stream.close()
+        pa.terminate()
+
 # ====================
-# LÓGICA PRINCIPAL DA IA (REATORADA E CORRIGIDA)
+# LÓGICA PRINCIPAL DA IA
 # ====================
 def executar_ia():
     global escutando, parar_tudo, persona_selecionada, interrompida
     while escutando and not parar_tudo:
-        entrada = ouvir_microfone()
-
-        if not escutando: break
-        if not entrada: continue
-
+        try:
+            entrada = audio_queue.get(timeout=1)
+        except Empty:
+            continue
         resposta_para_falar = None
-        
-        # --- Bloco de decisão: UM caminho será escolhido ---
         if persona_selecionada == "Ambiente":
             if entrada != "TIMEOUT_AMBIENTE":
                 prompt_ambiente = f"Você é uma IA em uma sala e ouviu a seguinte conversa de fundo: '{entrada}'. Se parecer apropriado, faça um comentário curto e inteligente para se incluir na conversa. Se não for relevante ou for apenas ruído, responda com a palavra 'SILENCIO'."
@@ -249,9 +246,8 @@ def executar_ia():
                     resposta_ambiente = model.generate_content(prompt_ambiente).text.strip()
                     if "SILENCIO" not in resposta_ambiente:
                         resposta_para_falar = resposta_ambiente
-                except Exception as e:
-                    print(f"[ERRO] IA Ambiente falhou: {e}\n")
-        else: # Lógica para todas as outras personas normais
+                except Exception as e: print(f"[ERRO] IA Ambiente falhou: {e}\n")
+        else:
             prompt = montar_prompt_com_contexto(entrada)
             try:
                 resposta_para_falar = model.generate_content(prompt).text.strip()
@@ -259,24 +255,17 @@ def executar_ia():
             except Exception as e:
                 print(f"[ERRO] Falha ao gerar resposta: {e}\n")
                 resposta_para_falar = "Tive um problema para pensar."
-        
-        # --- Bloco de Ação: Executa a fala se uma resposta foi gerada ---
         if resposta_para_falar:
-            # Limpa a resposta de caracteres de formatação indesejados
             resposta_para_falar = resposta_para_falar.replace("*", "").replace("_", "")
-
             print(f"[YUMA] {resposta_para_falar}\n")
             threading.Thread(target=speak_thread, args=(resposta_para_falar,), daemon=True).start()
-            
-            # Loop de monitoramento de interrupção enquanto fala
             while falando and not interrompida and escutando:
-                ouvir_microfone()
+                monitorar_interrupcao()
                 time.sleep(0.1)
-            
-            # Limpa o estado de interrupção e dá um cooldown para o microfone
             if interrompida:
                 time.sleep(0.5) 
                 interrompida = False
+        pode_ouvir_event.set()
 
 def montar_prompt_com_contexto(pergunta_atual):
     contexto = ""
@@ -289,21 +278,37 @@ def montar_prompt_com_contexto(pergunta_atual):
 # INTERFACE GRÁFICA (GUI)
 # ====================
 def acionar():
-    global escutando, parar_tudo, ultima_atividade
+    global escutando, parar_tudo, ultima_atividade, audio_queue
     if not escutando:
         parar_tudo, escutando = False, True
         memoria_contexto.clear()
+        audio_queue = Queue() 
         ultima_atividade = time.time()
         print(f"[INFO] IA Ativada. Persona: {persona_selecionada}\n")
         atualizar_botao_estado("parar")
         animar_circulo()
+        pode_ouvir_event.set()
         threading.Thread(target=executar_ia, daemon=True).start()
+        threading.Thread(target=thread_ouvinte, daemon=True).start()
     else:
         escutando, parar_tudo = False, True
+        pode_ouvir_event.set()
         print("[INFO] IA Parada.\n")
         threading.Thread(target=speak_thread, args=("Até mais!",), daemon=True).start()
         atualizar_botao_estado("falar")
 
+def on_closing():
+    global parar_tudo, escutando
+    print("[INFO] Fechando a aplicação...\n")
+    parar_tudo, escutando = True, False
+    pode_ouvir_event.set()
+    time.sleep(0.2) 
+    if pygame.mixer.get_init():
+        while pygame.mixer.music.get_busy(): time.sleep(0.1)
+    janela.destroy()
+    pygame.quit()
+
+# ... (o resto da GUI não muda)
 def atualizar_botao_estado(estado):
     if estado == "parar":
         botao_acao.configure(text="✖", fg_color="#FF4C4C", hover_color="#D93636")
@@ -318,28 +323,31 @@ def animar_circulo():
         if scale >= 1.10: direction = -0.5
         elif scale <= 0.94: direction = 0.5
         r = r0 * scale
-        canvas.coords(circulo, cx-r, cy-r, cx+r, cy+r)
-        janela.after(10, animar_circulo)
-    else:
+        if janela.winfo_exists():
+            canvas.coords(circulo, cx-r, cy-r, cx+r, cy+r)
+            janela.after(10, animar_circulo)
+    elif janela.winfo_exists():
         canvas.coords(circulo, cx-r0, cy-r0, cx+r0, cy+r0)
 
 def on_window_resize(event=None):
-    largura_janela = janela.winfo_width()
     global cx, cy
-    cx, cy = canvas.winfo_width() / 2, canvas.winfo_height() / 2
-    if not escutando: canvas.coords(circulo, cx-r0, cy-r0, cx+r0, cy+r0)
+    if janela.winfo_exists():
+        cx, cy = canvas.winfo_width() / 2, canvas.winfo_height() / 2
+        if not escutando:
+            canvas.coords(circulo, cx-r0, cy-r0, cx+r0, cy+r0)
 
 # --- Construção da Janela ---
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 janela = ctk.CTk()
 janela.title("Yuma")
-janela.geometry("500x620")
-janela.minsize(450, 580)
+janela.geometry("500x700") 
+janela.minsize(500, 650)
 
 settings_frame = ctk.CTkFrame(janela, fg_color="transparent")
 settings_frame.pack(side="top", fill="x", padx=20, pady=(10, 5))
 settings_frame.grid_columnconfigure(1, weight=1)
+
 label_mic = ctk.CTkLabel(settings_frame, text="Microfone", width=85, anchor="w")
 label_mic.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="w")
 mic_list, default_mic_index = listar_microfones()
@@ -352,40 +360,46 @@ if default_mic_index is not None and mic_list:
     if default_mic_name in mic_names:
         dropdown_mic.set(default_mic_name)
 dropdown_mic.grid(row=0, column=1, pady=5, sticky="ew")
+
 label_voz = ctk.CTkLabel(settings_frame, text="Voz da Yuma", width=85, anchor="w")
 label_voz.grid(row=1, column=0, padx=(0, 10), pady=5, sticky="w")
 vozes_disponiveis = ["pt-BR-FranciscaNeural", "pt-BR-ThalitaNeural"]
 dropdown_vozes = ctk.CTkOptionMenu(settings_frame, values=vozes_disponiveis, command=definir_voz)
 dropdown_vozes.set(voz_selecionada)
 dropdown_vozes.grid(row=1, column=1, pady=5, sticky="ew")
+
 label_persona = ctk.CTkLabel(settings_frame, text="Personas", width=85, anchor="w")
 label_persona.grid(row=2, column=0, padx=(0, 10), pady=5, sticky="w")
 dropdown_persona = ctk.CTkOptionMenu(settings_frame, values=list(PERSONALIDADES.keys()), command=definir_personalidade)
 dropdown_persona.set("Padrão")
 dropdown_persona.grid(row=2, column=1, pady=5, sticky="ew")
+
 label_volume = ctk.CTkLabel(settings_frame, text="Volume", width=85, anchor="w")
 label_volume.grid(row=3, column=0, padx=(0, 10), pady=5, sticky="w")
 slider_volume = ctk.CTkSlider(settings_frame, from_=0, to=100, number_of_steps=100, command=definir_volume)
 slider_volume.set(volume_atual * 100)
 slider_volume.grid(row=3, column=1, pady=5, sticky="ew")
 
+console_log = ctk.CTkTextbox(janela, height=120, state="disabled", text_color="#A9A9A9", font=("Courier New", 11))
+console_log.pack(side="bottom", pady=(10, 20), padx=20, fill="x")
+botao_acao = ctk.CTkButton(janela, text="🎙", width=80, height=80, corner_radius=40, font=("Arial", 32), fg_color="#009966", hover_color="#007a4d", command=acionar)
+botao_acao.pack(side="bottom", pady=10)
 canvas_frame = ctk.CTkFrame(janela, fg_color="transparent")
-canvas_frame.pack(expand=True, fill="both", padx=20, pady=10)
+canvas_frame.pack(side="top", expand=True, fill="both", padx=20, pady=10)
 canvas = tk.Canvas(canvas_frame, bg=janela.cget("fg_color")[1], highlightthickness=0)
 canvas.pack(expand=True, fill="both")
 circulo = canvas.create_oval(cx-r0, cy-r0, cx+r0, cy+r0, fill="#FFFFFF", outline="")
 
-botao_acao = ctk.CTkButton(janela, text="🎙", width=80, height=80, corner_radius=40, font=("Arial", 32), fg_color="#009966", hover_color="#007a4d", command=acionar)
-botao_acao.pack(pady=10)
-
-console_log = ctk.CTkTextbox(janela, height=120, state="disabled", text_color="#A9A9A9", font=("Courier New", 11))
-console_log.pack(pady=(10, 20), padx=20, fill="both", expand=True)
 
 if __name__ == "__main__":
+    # A inicialização global do Pygame é movida para dentro do main
+    # para garantir que aconteça no contexto certo.
+    pygame.mixer.init()
+    
     sys.stdout = ConsoleRedirector(console_log)
     definir_personalidade("Padrão")
+    janela.protocol("WM_DELETE_WINDOW", on_closing)
     janela.bind("<Configure>", on_window_resize)
     on_window_resize()
     print("[INFO] Yuma pronta. Selecione os dispositivos e clique em '🎙️'.\n")
     janela.mainloop()
-    parar_tudo = True
