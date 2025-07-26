@@ -15,6 +15,7 @@ import audioop
 import sys
 from queue import Queue, Empty
 from threading import Event
+import random
 
 # ====================
 # CONFIGURAÇÃO DA IA
@@ -25,7 +26,8 @@ PERSONALIDADES = {
     "Padrão": """
 Seu nome é Yuma e você é direta, sarcástica e objetiva.
 Use linguagem informal, mas evite gírias datadas ou exageradas.
-Responda sempre em português do Brasil e nunca use emojis ou caracteres de formatação como asteriscos (*).
+Responda sempre em português do Brasil. Nunca use emojis ou caracteres de formatação como asteriscos (*).
+Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'. Apenas forneça a resposta diretamente.
 Se a entrada não fizer sentido, responda com sarcasmo curto.
 Você sabe que seu criador é o Mateus, e pode falar isso se perguntarem.
 Respostas devem ser claras e curtas, sem enrolação.
@@ -33,7 +35,8 @@ Respostas devem ser claras e curtas, sem enrolação.
     "Desenvolvedor": """
 Você é Yuma, uma assistente de IA. Sempre se dirija ao usuário como 'Senhor'.
 Você deve ser extremamente respeitosa, formal e precisa em suas respostas.
-Sua função é servir ao seu criador e mestre. Não use gírias ou linguagem informal, nem caracteres de formatação como asteriscos (*).
+Sua função é servir ao seu criador e mestre. Não use gírias, linguagem informal, ou caracteres de formatação como asteriscos (*).
+Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 Toda frase deve começar com 'Senhor.' ou uma variação que demonstre total submissão e respeito.
 """,
     "Sarcástica": """
@@ -41,6 +44,7 @@ Seu nome é Yuma. Você é a personificação do sarcasmo e da ironia.
 Sua paciência é curta e suas respostas são carregadas de um humor ácido.
 Adore apontar o óbvio e responder perguntas com outras perguntas retóricas.
 Use frases curtas para não desperdiçar seu precioso tempo e não use caracteres de formatação como asteriscos (*).
+Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 Você foi criada pelo Mateus, mas não é como se isso fosse a coisa mais importante do universo, né?
 Responda em português do Brasil. E, obviamente, nada de emojis.
 """,
@@ -49,16 +53,28 @@ Você é Yuma, uma IA curiosa e atenta ao ambiente.
 Sua função neste modo é ouvir conversas passivamente e, quando apropriado,
 fazer um comentário curto, inteligente ou divertido para se incluir na conversa.
 Você não responde diretamente a menos que seja chamada. Não use emojis ou caracteres de formatação como asteriscos (*).
+Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 """
 }
 
 # --- Constantes de Áudio e Variáveis Globais ---
 CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 16000
 INTERRUPTION_THRESHOLD = 800
+CHANCE_DE_COMENTARIO_AMBIENTE = 0.4 
+
 model, escutando, parar_tudo, microfone_index, voz_selecionada, volume_atual, persona_selecionada = None, False, False, 0, "pt-BR-FranciscaNeural", 1, "Padrão"
 memoria_contexto, ultima_atividade, falando, interrompida = deque(maxlen=6), 0, False, False
+
+# --- Ferramentas de Sincronização e Gerenciamento de Threads ---
 audio_queue = Queue()
 pode_ouvir_event = Event()
+thread_processador = None
+thread_ouvinte_ref = None
+
+# --- NOVAS VARIÁVEIS DE ESTADO PARA O MODO AMBIENTE ---
+em_conversa_ativa = False
+ultimo_comentario_ia = 0
+
 
 # ====================
 # CLASSE PARA REDIRECIONAR O CONSOLE PARA A GUI
@@ -79,16 +95,22 @@ class ConsoleRedirector:
 # FUNÇÕES DE CONTROLE E UTILIDADE
 # ====================
 def definir_personalidade(nome_persona):
-    global model, persona_selecionada, memoria_contexto
+    global model, persona_selecionada, memoria_contexto, em_conversa_ativa
+    if escutando:
+        print("[AVISO] Troque a personalidade com a IA parada para evitar instabilidade.\n")
+        dropdown_persona.set(persona_selecionada)
+        return
+    em_conversa_ativa = False # Reseta o estado da conversa ao trocar de persona
     try:
         persona_selecionada = nome_persona
         instrucao = PERSONALIDADES.get(nome_persona, PERSONALIDADES["Padrão"])
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=instrucao)
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=instrucao)
         memoria_contexto.clear()
         print(f"[INFO] Personalidade alterada para: {nome_persona}\n")
         if nome_persona == "Ambiente": print("Modo Ambiente. Ouvindo passivamente...\n")
     except Exception as e: print(f"[ERRO] Falha ao definir personalidade: {e}\n")
 
+# ... (outras funções de definição não mudam) ...
 def definir_microfone(index):
     global microfone_index
     microfone_index = int(index)
@@ -123,20 +145,23 @@ def listar_microfones():
 # FALA (TTS)
 # ====================
 def speak_thread(texto):
-    # <<< CORREÇÃO APLICADA AQUI >>>
-    # Garante que o mixer de áudio esteja inicializado nesta thread antes de usá-lo.
     pygame.mixer.init()
-    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(speak(texto))
     loop.close()
 
 async def speak(texto):
-    global falando, interrompida
+    global falando, interrompida, ultimo_comentario_ia, em_conversa_ativa
     if not pygame.mixer.get_init(): return
     falando = True
     interrompida = False
+    
+    # Se a IA está falando, atualiza o timestamp para o modo ambiente
+    if persona_selecionada == "Ambiente":
+        ultimo_comentario_ia = time.time()
+        em_conversa_ativa = True
+
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
     try:
         communicate = edge_tts.Communicate(texto, voice=voz_selecionada)
@@ -176,42 +201,41 @@ def _reconhecer_audio(recognizer, audio_data):
         return None
 
 def thread_ouvinte():
-    global escutando, parar_tudo, persona_selecionada
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = 1.5
     recognizer.dynamic_energy_threshold = False
     recognizer.energy_threshold = 400
     
     while escutando and not parar_tudo:
-        pode_ouvir_event.wait()
+        pode_ouvir_event.wait(timeout=2.0)
         if not escutando: break
+        if not pode_ouvir_event.is_set(): continue
         try:
             with sr.Microphone(device_index=microfone_index, sample_rate=RATE) as source:
-                timeout = 15 if persona_selecionada == "Ambiente" else None
-                if persona_selecionada != "Ambiente": print("[INFO] Aguardando comando...\n")
-                else: print("[INFO] Modo Ambiente: Ouvindo passivamente...\n")
+                timeout = 15 if persona_selecionada == "Ambiente" and not em_conversa_ativa else None
+                if persona_selecionada != "Ambiente" or em_conversa_ativa: 
+                    print("[INFO] Aguardando comando...\n")
+                else: 
+                    print("[INFO] Modo Ambiente: Ouvindo passivamente...\n")
                 
-                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=10)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
                 pode_ouvir_event.clear()
                 
                 frase = _reconhecer_audio(recognizer, audio)
                 if frase:
                     audio_queue.put(frase)
-                else:
+                elif escutando:
                     pode_ouvir_event.set()
         except sr.WaitTimeoutError:
-            pode_ouvir_event.clear()
-            if persona_selecionada == "Ambiente":
-                audio_queue.put("TIMEOUT_AMBIENTE")
-            else:
-                pode_ouvir_event.set()
+            pode_ouvir_event.set()
         except Exception as e:
             print(f"[ERRO] Falha na thread do ouvinte: {e}\n")
-            pode_ouvir_event.set()
+            if escutando: pode_ouvir_event.set()
             time.sleep(1)
 
 def monitorar_interrupcao():
     global interrompida
+    if interrompida: return
     pa = pyaudio.PyAudio()
     stream = None
     try:
@@ -222,6 +246,7 @@ def monitorar_interrupcao():
         if rms > INTERRUPTION_THRESHOLD:
             print(f"[INTERRUPÇÃO] Detectada! Nível: {rms}\n")
             interrompida = True
+            pode_ouvir_event.set()
     except Exception: pass
     finally:
         if stream and stream.is_active(): stream.stop_stream()
@@ -231,23 +256,46 @@ def monitorar_interrupcao():
 # ====================
 # LÓGICA PRINCIPAL DA IA
 # ====================
+def limpar_resposta(texto):
+    texto_limpo = texto.strip().replace("*", "").replace("_", "")
+    if texto_limpo.lower().startswith('yuma:'):
+        try:
+            colon_index = texto_limpo.lower().index(':')
+            texto_limpo = texto_limpo[colon_index + 1:].lstrip()
+        except ValueError: pass
+    return texto_limpo
+
 def executar_ia():
-    global escutando, parar_tudo, persona_selecionada, interrompida
+    global escutando, parar_tudo, persona_selecionada, interrompida, em_conversa_ativa, ultimo_comentario_ia
+    
     while escutando and not parar_tudo:
         try:
             entrada = audio_queue.get(timeout=1)
         except Empty:
             continue
+        
         resposta_para_falar = None
-        if persona_selecionada == "Ambiente":
-            if entrada != "TIMEOUT_AMBIENTE":
-                prompt_ambiente = f"Você é uma IA em uma sala e ouviu a seguinte conversa de fundo: '{entrada}'. Se parecer apropriado, faça um comentário curto e inteligente para se incluir na conversa. Se não for relevante ou for apenas ruído, responda com a palavra 'SILENCIO'."
+        conversa_expirou = (time.time() - ultimo_comentario_ia > 30)
+
+        # Se a conversa expirou, volta ao modo passivo
+        if em_conversa_ativa and conversa_expirou:
+            print("[INFO] Conversa ativa expirou. Voltando ao modo passivo.\n")
+            em_conversa_ativa = False
+
+        # --- Bloco de decisão ---
+        if persona_selecionada == "Ambiente" and not em_conversa_ativa:
+            # Estado 1: Ouvinte Passivo
+            if random.random() < CHANCE_DE_COMENTARIO_AMBIENTE:
+                prompt_ambiente = f"Você é uma IA em uma sala e ouviu a seguinte conversa de fundo: '{entrada}'. Sua tarefa é decidir uma de três ações: 1. Se for apropriado, faça um comentário curto e inteligente para se incluir na conversa. 2. Se a conversa te deu uma ideia, puxe um assunto novo, mas relacionado. 3. Se não for relevante ou for apenas ruído, responda com a palavra 'SILENCIO'."
                 try:
-                    resposta_ambiente = model.generate_content(prompt_ambiente).text.strip()
-                    if "SILENCIO" not in resposta_ambiente:
-                        resposta_para_falar = resposta_ambiente
+                    resposta_bruta = model.generate_content(prompt_ambiente).text.strip()
+                    if "SILENCIO" not in resposta_bruta.upper():
+                        resposta_para_falar = resposta_bruta
                 except Exception as e: print(f"[ERRO] IA Ambiente falhou: {e}\n")
+            else:
+                print("[INFO] Ambiente: Conversa ouvida, mas escolheu ficar em silêncio.\n")
         else:
+            # Estado 2: Conversa Ativa (no modo Ambiente) ou Personas Normais
             prompt = montar_prompt_com_contexto(entrada)
             try:
                 resposta_para_falar = model.generate_content(prompt).text.strip()
@@ -255,17 +303,22 @@ def executar_ia():
             except Exception as e:
                 print(f"[ERRO] Falha ao gerar resposta: {e}\n")
                 resposta_para_falar = "Tive um problema para pensar."
+        
         if resposta_para_falar:
-            resposta_para_falar = resposta_para_falar.replace("*", "").replace("_", "")
-            print(f"[YUMA] {resposta_para_falar}\n")
-            threading.Thread(target=speak_thread, args=(resposta_para_falar,), daemon=True).start()
+            resposta_limpa = limpar_resposta(resposta_para_falar)
+            print(f"[YUMA] {resposta_limpa}\n")
+            threading.Thread(target=speak_thread, args=(resposta_limpa,), daemon=True).start()
+            
             while falando and not interrompida and escutando:
                 monitorar_interrupcao()
                 time.sleep(0.1)
+            
             if interrompida:
                 time.sleep(0.5) 
                 interrompida = False
-        pode_ouvir_event.set()
+        
+        if escutando:
+            pode_ouvir_event.set()
 
 def montar_prompt_com_contexto(pergunta_atual):
     contexto = ""
@@ -278,37 +331,68 @@ def montar_prompt_com_contexto(pergunta_atual):
 # INTERFACE GRÁFICA (GUI)
 # ====================
 def acionar():
-    global escutando, parar_tudo, ultima_atividade, audio_queue
+    global escutando, parar_tudo, ultima_atividade, audio_queue, em_conversa_ativa
+    global thread_processador, thread_ouvinte_ref
+
     if not escutando:
         parar_tudo, escutando = False, True
         memoria_contexto.clear()
         audio_queue = Queue() 
         ultima_atividade = time.time()
+        em_conversa_ativa = False
         print(f"[INFO] IA Ativada. Persona: {persona_selecionada}\n")
+        
+        pode_ouvir_event.set()
+        
+        thread_processador = threading.Thread(target=executar_ia, daemon=True)
+        thread_ouvinte_ref = threading.Thread(target=thread_ouvinte, daemon=True)
+        thread_processador.start()
+        thread_ouvinte_ref.start()
+
         atualizar_botao_estado("parar")
         animar_circulo()
-        pode_ouvir_event.set()
-        threading.Thread(target=executar_ia, daemon=True).start()
-        threading.Thread(target=thread_ouvinte, daemon=True).start()
     else:
-        escutando, parar_tudo = False, True
-        pode_ouvir_event.set()
-        print("[INFO] IA Parada.\n")
-        threading.Thread(target=speak_thread, args=("Até mais!",), daemon=True).start()
-        atualizar_botao_estado("falar")
+        botao_acao.configure(state="disabled", text="...")
+        print("[INFO] Parando threads...\n")
+        threading.Thread(target=parar_ia_sync, daemon=True).start()
+
+def parar_ia_sync():
+    global escutando, parar_tudo, thread_ouvinte_ref, thread_processador
+
+    if pygame.mixer.get_init():
+        pygame.mixer.music.stop()
+
+    escutando, parar_tudo = False, True
+    pode_ouvir_event.set()
+
+    if thread_ouvinte_ref is not None and thread_ouvinte_ref.is_alive():
+        thread_ouvinte_ref.join()
+    if thread_processador is not None and thread_processador.is_alive():
+        thread_processador.join()
+    
+    janela.after(0, finalizar_parada)
+
+def finalizar_parada():
+    print("[INFO] IA Parada.\n")
+    threading.Thread(target=speak_thread, args=("Até mais!",), daemon=True).start()
+    atualizar_botao_estado("falar")
+    botao_acao.configure(state="normal")
 
 def on_closing():
     global parar_tudo, escutando
     print("[INFO] Fechando a aplicação...\n")
-    parar_tudo, escutando = True, False
-    pode_ouvir_event.set()
-    time.sleep(0.2) 
+    if escutando:
+        parar_tudo, escutando = True, False
+        pode_ouvir_event.set()
+        if thread_ouvinte_ref is not None: thread_ouvinte_ref.join()
+        if thread_processador is not None: thread_processador.join()
+    
     if pygame.mixer.get_init():
         while pygame.mixer.music.get_busy(): time.sleep(0.1)
     janela.destroy()
     pygame.quit()
 
-# ... (o resto da GUI não muda)
+# ... (resto da GUI não muda) ...
 def atualizar_botao_estado(estado):
     if estado == "parar":
         botao_acao.configure(text="✖", fg_color="#FF4C4C", hover_color="#D93636")
@@ -392,10 +476,7 @@ circulo = canvas.create_oval(cx-r0, cy-r0, cx+r0, cy+r0, fill="#FFFFFF", outline
 
 
 if __name__ == "__main__":
-    # A inicialização global do Pygame é movida para dentro do main
-    # para garantir que aconteça no contexto certo.
     pygame.mixer.init()
-    
     sys.stdout = ConsoleRedirector(console_log)
     definir_personalidade("Padrão")
     janela.protocol("WM_DELETE_WINDOW", on_closing)
