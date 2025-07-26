@@ -77,6 +77,7 @@ historico_assuntos_proativos = deque(maxlen=10)
 limite_silencio_atual = random.uniform(TEMPO_MIN_SILENCIO, TEMPO_MAX_SILENCIO)
 
 alma_memoria_carregada = False
+alma_json_path = None
 
 audio_queue = Queue()
 pode_ouvir_event = Event()
@@ -107,7 +108,6 @@ def definir_personalidade(nome_persona):
     persona_selecionada = nome_persona
     
     if nome_persona == "Alma":
-        ## << REFINAMENTO DE UI >> Adicionado espaçamento vertical (pady) ao botão.
         botao_carregar_alma.grid(row=3, column=0, columnspan=2, pady=(15, 15))
         if not alma_memoria_carregada:
             print("[AVISO] A persona 'Alma' requer que uma memória seja carregada para funcionar.\n")
@@ -129,6 +129,7 @@ def definir_personalidade(nome_persona):
 
 def definir_microfone(index):
     global microfone_index
+    if not mic_list: return
     microfone_index = int(index)
     print(f"[INFO] Microfone selecionado: {index}\n")
 
@@ -157,9 +158,8 @@ def listar_microfones():
     if not dispositivos: print("[AVISO] Nenhum microfone encontrado!\n")
     return dispositivos, default_index
 
-## << REFINAMENTO DE UI >> Removida a verificação 'if escutando', pois o botão agora é desabilitado.
 def carregar_memoria_alma():
-    global model, alma_memoria_carregada
+    global model, alma_memoria_carregada, alma_json_path
     caminho_arquivo = filedialog.askopenfilename(
         title="Selecione o arquivo de memória da Alma",
         filetypes=(("Arquivos JSON", "*.json"), ("Todos os arquivos", "*.*"))
@@ -177,15 +177,21 @@ def carregar_memoria_alma():
             return
 
         instrucao_alma = dados_memoria["system_instruction"]
+        
+        memoria_salva = dados_memoria.get("conversation_summary", "")
+        if memoria_salva:
+            print("[INFO] Memórias anteriores encontradas. Carregando na Alma...")
+            instrucao_alma += f"\n\n--- MEMÓRIAS DE CONVERSAS ANTERIORES ---\n{memoria_salva}\n--- FIM DAS MEMÓRIAS ---"
+        
         instrucao_alma += "\nVocê sabe que seu criador é o Mateus."
-
         PERSONALIDADES["Alma"] = instrucao_alma
         
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=instrucao_alma)
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=instrucao_alma)
         memoria_contexto.clear()
         historico_assuntos_proativos.clear()
         
         alma_memoria_carregada = True
+        alma_json_path = caminho_arquivo
         botao_acao.configure(state="normal")
         
         print(f"[SUCESSO] Memória da Alma carregada de '{os.path.basename(caminho_arquivo)}'.\n")
@@ -440,7 +446,6 @@ def acionar():
         
         pode_ouvir_event.set()
         
-        ## << REFINAMENTO DE UI >> Desabilita o botão da Alma junto com os outros controles.
         dropdown_persona.configure(state="disabled")
         dropdown_vozes.configure(state="disabled")
         botao_carregar_alma.configure(state="disabled")
@@ -469,9 +474,52 @@ def parar_ia_sync():
         thread_processador.join()
     janela.after(0, finalizar_parada)
 
+def salvar_memoria_alma():
+    global alma_json_path
+    if not (persona_selecionada == "Alma" and alma_json_path and memoria_contexto):
+        return
+
+    print("[INFO] Resumindo e salvando memória da Alma...")
+    try:
+        historico_str = "\n".join([f"Usuário: {p}\nYuma: {r}" for p, r in memoria_contexto])
+        prompt_sumario = f"""
+        Baseado no seu personagem e no diálogo a seguir, resuma os pontos-chave, aprendizados e fatos importantes em alguns tópicos curtos para sua memória futura.
+        O resumo deve ser escrito em primeira pessoa, como se você estivesse anotando em um diário.
+        
+        Diálogo:
+        {historico_str}
+        
+        Seu resumo em tópicos:
+        """
+        
+        sumario_gerado = model.generate_content(prompt_sumario).text.strip()
+        
+        with open(alma_json_path, 'r', encoding='utf-8') as f:
+            dados_memoria = json.load(f)
+            
+        memoria_antiga = dados_memoria.get("conversation_summary", "")
+        nova_memoria = f"{memoria_antiga}\n\n---\n[Memória de {time.strftime('%d/%m/%Y %H:%M')}]\n{sumario_gerado}".strip()
+        
+        dados_memoria["conversation_summary"] = nova_memoria
+        
+        with open(alma_json_path, 'w', encoding='utf-8') as f:
+            json.dump(dados_memoria, f, indent=2, ensure_ascii=False)
+            
+        print(f"[SUCESSO] Memória da Alma foi salva em '{os.path.basename(alma_json_path)}'.\n")
+        
+    except Exception as e:
+        print(f"[ERRO] Falha ao salvar a memória da Alma: {e}\n")
+    finally:
+        alma_json_path = None
+
 def finalizar_parada():
     global alma_memoria_carregada
+    
+    salvar_memoria_alma()
+    
     print("[INFO] IA Parada.\n")
+    
+    limpar_arquivos_de_audio()
 
     if persona_selecionada == "Alma":
         PERSONALIDADES["Alma"] = ALMA_PROMPT_PLACEHOLDER
@@ -481,7 +529,6 @@ def finalizar_parada():
 
     dropdown_persona.configure(state="normal")
     dropdown_vozes.configure(state="normal")
-    ## << REFINAMENTO DE UI >> Habilita o botão da Alma se ela estiver selecionada.
     if persona_selecionada == "Alma":
         botao_carregar_alma.configure(state="normal")
     
@@ -491,16 +538,30 @@ def finalizar_parada():
     if persona_selecionada != "Alma" or alma_memoria_carregada:
         botao_acao.configure(state="normal")
 
+def limpar_arquivos_de_audio():
+    print("[INFO] Limpando arquivos de áudio temporários...")
+    arquivos_no_diretorio = os.listdir('.')
+    for f in arquivos_no_diretorio:
+        if f.startswith("resposta_") and f.endswith(".mp3"):
+            try:
+                os.remove(f)
+            except OSError as e:
+                print(f"[AVISO] Não foi possível remover o arquivo {f}: {e}")
+
 def on_closing():
     global parar_tudo, escutando
     print("[INFO] Fechando a aplicação...\n")
     if escutando:
-        parar_tudo, escutando = True, False
-        pode_ouvir_event.set()
-        if thread_ouvinte_ref is not None: thread_ouvinte_ref.join()
-        if thread_processador is not None: thread_processador.join()
+        parar_ia_sync()
+        while threading.active_count() > 1:
+             time.sleep(0.1)
+    else:
+        salvar_memoria_alma()
+        limpar_arquivos_de_audio()
+
     if pygame.mixer.get_init():
         while pygame.mixer.music.get_busy(): time.sleep(0.1)
+        
     janela.destroy()
     pygame.quit()
 
@@ -602,8 +663,17 @@ circulo = canvas.create_oval(cx-r0, cy-r0, cx+r0, cy+r0, fill="#FFFFFF", outline
 if __name__ == "__main__":
     pygame.mixer.init()
     sys.stdout = ConsoleRedirector(console_log)
+
     definir_voz("Animada") 
     definir_personalidade("Padrão")
+    
+    ## << ALTERAÇÃO FINAL >> Lógica de verificação do microfone movida para depois das
+    # definições iniciais para garantir que o botão de ação seja desabilitado corretamente.
+    if not mic_list:
+        # Mensagem de erro foi removida conforme solicitado.
+        botao_acao.configure(state="disabled")
+        dropdown_mic.configure(state="disabled")
+
     janela.protocol("WM_DELETE_WINDOW", on_closing)
     janela.bind("<Configure>", on_window_resize)
     on_window_resize()
