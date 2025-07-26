@@ -81,8 +81,8 @@ def listar_microfones():
                 ("microfone" in nome) or 
                 ("input" in nome) or 
                 ("capture" in nome) or
-                (saida == 0) or  # Se não tem saída, é bem provável ser microfone
-                (entrada >= 1 and saida <= 1)  # Entrada bem maior que saída
+                (saida == 0) or
+                (entrada >= 1 and saida <= 1)
             ):
                 dispositivos.append((i, info["name"]))
 
@@ -230,13 +230,13 @@ def animar_circulo():
     global scale, direction
     if escutando:
         scale += direction * (delta / 100)
-        if scale >= 1.04:
-            direction = -1
-        elif scale <= 0.96:
-            direction = 1
+        if scale >= 1.10:
+            direction = -0.5
+        elif scale <= 0.94:
+            direction = 0.5
         r = r0 * scale
         canvas.coords(circulo, cx-r, cy-r, cx+r, cy+r)
-        janela.after(20, animar_circulo)
+        janela.after(10, animar_circulo)
 
 
 def atualizar_canvas_tamanho(event):
