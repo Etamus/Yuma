@@ -8,6 +8,8 @@ import pygame
 import threading
 import customtkinter as ctk
 import tkinter as tk
+from tkinter import filedialog
+import json
 import pyaudio
 from collections import deque
 import time
@@ -22,26 +24,32 @@ import random
 # ====================
 genai.configure(api_key="")
 
+ALMA_PROMPT_PLACEHOLDER = """
+Persona Alma ainda não carregada. Por favor, carregue um arquivo de memória .json.
+Você sabe que seu criador é o Mateus.
+"""
+
 PERSONALIDADES = {
     "Padrão": """
 Seu nome é Yuma. Você é uma IA de conversação geral, prestativa e amigável.
 Seu objetivo é conversar de forma natural e versátil sobre qualquer assunto.
+Você sabe que seu criador é o Mateus.
 Responda sempre em português do Brasil. Nunca use emojis ou caracteres de formatação.
 Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'. Forneça a resposta diretamente.
-Você sabe que seu criador é o Mateus.
 Respostas devem ser claras e diretas.
 """,
     "Assistente": """
 Você é Yuma, uma assistente de IA. Você deve ser formal, precisa e objetiva em suas respostas.
 Sua função é fornecer informações e executar tarefas com eficiência.
+Você sabe que seu criador é o Mateus.
 Não use gírias ou linguagem excessivamente informal. Nunca use emojis ou caracteres de formatação.
 Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 """,
     "Ambiente: Padrão": """
-Você é Yuma, uma IA curiosa e atenta ao ambiente.
-Sua função neste modo é ouvir conversas passivamente e, apenas ocasionalmente, se achar muito apropriado,
-fazer um comentário curto e inteligente para se incluir na conversa.
+Você é Yuma, uma IA curiosa e atenta ao ambiente. Sua função neste modo é ouvir conversas passivamente e,
+apenas ocasionalmente, se achar muito apropriado, fazer um comentário curto e inteligente para se incluir na conversa.
 Na maior parte do tempo, você deve permanecer em silêncio.
+Você sabe que seu criador é o Mateus.
 Nunca use emojis ou caracteres de formatação. Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 """,
     "Ambiente: Interativa": """
@@ -50,8 +58,10 @@ Seu objetivo é ser uma presença divertida no ambiente.
 1.  **Reação Passiva:** Você ouve as conversas de fundo. De vez em quando, se tiver algo muito engraçado ou irônico para dizer, você faz um comentário curto para zoar ou brincar com o que ouviu. Na maior parte do tempo, você ignora.
 2.  **Proatividade:** Se o ambiente ficar quieto por muito tempo, você pode quebrar o gelo com uma pergunta provocadora, uma observação sarcástica sobre a vida ou um assunto aleatório com um toque de humor.
 3.  **Tom:** Sempre brincalhão e um pouco 'debochado'. Nunca leve nada muito a sério.
+Você sabe que seu criador é o Mateus.
 Nunca use emojis ou caracteres de formatação. Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
-"""
+""",
+    "Alma": ALMA_PROMPT_PLACEHOLDER
 }
 
 # --- Constantes de Áudio e Variáveis Globais ---
@@ -65,6 +75,8 @@ model, escutando, parar_tudo, microfone_index, voz_selecionada, volume_atual, pe
 memoria_contexto, ultima_atividade, falando, interrompida = deque(maxlen=6), 0, False, False
 historico_assuntos_proativos = deque(maxlen=10)
 limite_silencio_atual = random.uniform(TEMPO_MIN_SILENCIO, TEMPO_MAX_SILENCIO)
+
+alma_memoria_carregada = False
 
 audio_queue = Queue()
 pode_ouvir_event = Event()
@@ -91,10 +103,24 @@ def definir_personalidade(nome_persona):
         print("[AVISO] Troque a personalidade com a IA parada para evitar instabilidade.\n")
         dropdown_persona.set(persona_selecionada)
         return
+
+    persona_selecionada = nome_persona
+    
+    if nome_persona == "Alma":
+        ## << REFINAMENTO DE UI >> Adicionado espaçamento vertical (pady) ao botão.
+        botao_carregar_alma.grid(row=3, column=0, columnspan=2, pady=(15, 15))
+        if not alma_memoria_carregada:
+            print("[AVISO] A persona 'Alma' requer que uma memória seja carregada para funcionar.\n")
+            botao_acao.configure(state="disabled")
+        else:
+            botao_acao.configure(state="normal")
+    else:
+        botao_carregar_alma.grid_remove()
+        botao_acao.configure(state="normal")
+
     em_conversa_ativa = False
     try:
-        persona_selecionada = nome_persona
-        instrucao = PERSONALIDADES.get(nome_persona, PERSONALIDADES["Padrão"])
+        instrucao = PERSONALIDADES.get(nome_persona)
         model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=instrucao)
         memoria_contexto.clear()
         historico_assuntos_proativos.clear()
@@ -106,10 +132,10 @@ def definir_microfone(index):
     microfone_index = int(index)
     print(f"[INFO] Microfone selecionado: {index}\n")
 
-def definir_voz(voz_nome):
+def definir_voz(nome_amigavel):
     global voz_selecionada
-    voz_selecionada = voz_nome
-    print(f"[INFO] Voz selecionada: {voz_nome}\n")
+    voz_selecionada = VOZES_MAP.get(nome_amigavel, "pt-BR-FranciscaNeural")
+    print(f"[INFO] Voz selecionada: {nome_amigavel} ({voz_selecionada})\n")
 
 def definir_volume(valor):
     global volume_atual
@@ -131,6 +157,45 @@ def listar_microfones():
     if not dispositivos: print("[AVISO] Nenhum microfone encontrado!\n")
     return dispositivos, default_index
 
+## << REFINAMENTO DE UI >> Removida a verificação 'if escutando', pois o botão agora é desabilitado.
+def carregar_memoria_alma():
+    global model, alma_memoria_carregada
+    caminho_arquivo = filedialog.askopenfilename(
+        title="Selecione o arquivo de memória da Alma",
+        filetypes=(("Arquivos JSON", "*.json"), ("Todos os arquivos", "*.*"))
+    )
+    if not caminho_arquivo:
+        print("[INFO] Carregamento de memória cancelado.\n")
+        return
+
+    try:
+        with open(caminho_arquivo, 'r', encoding='utf-8') as f:
+            dados_memoria = json.load(f)
+
+        if "system_instruction" not in dados_memoria:
+            print("[ERRO] Arquivo JSON inválido. A chave 'system_instruction' não foi encontrada.\n")
+            return
+
+        instrucao_alma = dados_memoria["system_instruction"]
+        instrucao_alma += "\nVocê sabe que seu criador é o Mateus."
+
+        PERSONALIDADES["Alma"] = instrucao_alma
+        
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=instrucao_alma)
+        memoria_contexto.clear()
+        historico_assuntos_proativos.clear()
+        
+        alma_memoria_carregada = True
+        botao_acao.configure(state="normal")
+        
+        print(f"[SUCESSO] Memória da Alma carregada de '{os.path.basename(caminho_arquivo)}'.\n")
+        print(f"[INFO] Modelo redefinido. A Alma está pronta para iniciar.\n")
+
+    except json.JSONDecodeError:
+        print(f"[ERRO] O arquivo '{os.path.basename(caminho_arquivo)}' não é um JSON válido.\n")
+    except Exception as e:
+        print(f"[ERRO] Falha ao carregar ou processar o arquivo de memória: {e}\n")
+
 def speak_thread(texto):
     pygame.mixer.init()
     loop = asyncio.new_event_loop()
@@ -147,10 +212,9 @@ async def speak(texto):
         ultimo_comentario_ia = time.time()
         em_conversa_ativa = True
     
-    # <<< CORREÇÃO: Reseta o timer e loga o próximo tempo proativo DEPOIS que a IA fala >>>
     ultima_atividade = time.time()
     limite_silencio_atual = random.uniform(TEMPO_MIN_SILENCIO, TEMPO_MAX_SILENCIO)
-    if persona_selecionada in ["Padrão", "Ambiente: Interativa"]:
+    if persona_selecionada in ["Padrão", "Ambiente: Interativa", "Alma"]:
         print(f"[FALA PROATIVA] Próxima verificação em {limite_silencio_atual:.0f}s de silêncio.")
         
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
@@ -180,7 +244,7 @@ def _reconhecer_audio(recognizer, audio_data):
     global ultima_atividade
     try:
         frase = recognizer.recognize_google(audio_data, language='pt-BR')
-        ultima_atividade = time.time() # Apenas atualiza o timestamp da atividade do usuário
+        ultima_atividade = time.time() 
         print(f"[USUÁRIO] {frase}\n")
         return frase
     except sr.UnknownValueError: return None
@@ -259,13 +323,29 @@ def puxar_assunto_proativo():
     
     assuntos_evitar = "\n".join(f"- {item}" for item in historico_assuntos_proativos)
     prompt_evitar = f"Evite tópicos similares a estes que você já iniciou:\n{assuntos_evitar}\n" if historico_assuntos_proativos else ""
+    historico = "\n".join([f"Usuário: {p}\nYuma: {r}" for p, r in memoria_contexto])
 
-    # <<< CORREÇÃO: Prompt específico para a persona Interativa >>>
-    if persona_selecionada == "Ambiente: Interativa":
+    prompt = ""
+    if persona_selecionada == "Alma":
+        instrucao_alma = PERSONALIDADES.get("Alma", "")
+        prompt = f"""
+        Sua personalidade é definida pela seguinte instrução:
+        ---
+        {instrucao_alma}
+        ---
+        Baseando-se estritamente na sua personalidade, no nosso histórico de conversa recente (se houver) e evitando tópicos repetidos, gere uma observação, pergunta ou reflexão proativa para quebrar o silêncio. Seja criativo e mantenha-se fiel ao seu personagem.
+
+        Histórico da conversa:
+        {historico}
+
+        {prompt_evitar}
+
+        Sua fala proativa:
+        """
+    elif persona_selecionada == "Ambiente: Interativa":
         prompt = f"{prompt_evitar}Gere uma pergunta provocadora, uma observação sarcástica ou um tópico de conversa aleatório com um toque de humor e ironia para quebrar o silêncio. Seja criativo e divertido."
-    else: # Prompt para a persona Padrão
+    else: # Padrão
         if memoria_contexto and random.random() < 0.33:
-            historico = "\n".join([f"Usuário: {p}\nYuma: {r}" for p, r in memoria_contexto])
             prompt = f"Baseado neste histórico de conversa recente:\n---\n{historico}\n---\n{prompt_evitar}Faça uma pergunta ou um comentário criativo para reengajar o usuário, aprofundando em um dos tópicos ou fazendo uma transição suave para um assunto relacionado. Seja breve e natural."
         else:
             prompt = f"{prompt_evitar}Gere uma pergunta curta, curiosa ou uma observação interessante para quebrar o silêncio e iniciar uma conversa com um usuário que está quieto. O assunto deve ser aleatório e criativo."
@@ -286,13 +366,15 @@ def executar_ia():
         try:
             entrada = audio_queue.get(timeout=1)
         except Empty:
-            if persona_selecionada in ["Padrão", "Ambiente: Interativa"]:
+            if falando:
+                continue
+
+            if persona_selecionada in ["Padrão", "Ambiente: Interativa", "Alma"]:
                 resposta_para_falar = puxar_assunto_proativo()
             
             if not resposta_para_falar:
                 continue
         
-        # <<< CORREÇÃO: Adiciona o contexto da fala proativa ANTES de processar a resposta do usuário >>>
         if resposta_para_falar:
              memoria_contexto.append(("(Iniciativa da IA)", resposta_para_falar))
         else:
@@ -358,8 +440,10 @@ def acionar():
         
         pode_ouvir_event.set()
         
+        ## << REFINAMENTO DE UI >> Desabilita o botão da Alma junto com os outros controles.
         dropdown_persona.configure(state="disabled")
         dropdown_vozes.configure(state="disabled")
+        botao_carregar_alma.configure(state="disabled")
         
         thread_processador = threading.Thread(target=executar_ia, daemon=True)
         thread_ouvinte_ref = threading.Thread(target=thread_ouvinte, daemon=True)
@@ -386,13 +470,26 @@ def parar_ia_sync():
     janela.after(0, finalizar_parada)
 
 def finalizar_parada():
+    global alma_memoria_carregada
     print("[INFO] IA Parada.\n")
+
+    if persona_selecionada == "Alma":
+        PERSONALIDADES["Alma"] = ALMA_PROMPT_PLACEHOLDER
+        alma_memoria_carregada = False
+        botao_acao.configure(state="disabled")
+        print("[INFO] Memória da Alma foi descarregada.\n")
+
     dropdown_persona.configure(state="normal")
     dropdown_vozes.configure(state="normal")
+    ## << REFINAMENTO DE UI >> Habilita o botão da Alma se ela estiver selecionada.
+    if persona_selecionada == "Alma":
+        botao_carregar_alma.configure(state="normal")
     
     threading.Thread(target=speak_thread, args=("Até mais!",), daemon=True).start()
     atualizar_botao_estado("falar")
-    botao_acao.configure(state="normal")
+
+    if persona_selecionada != "Alma" or alma_memoria_carregada:
+        botao_acao.configure(state="normal")
 
 def on_closing():
     global parar_tudo, escutando
@@ -434,48 +531,68 @@ def on_window_resize(event=None):
         if not escutando:
             canvas.coords(circulo, cx-r0, cy-r0, cx+r0, cy+r0)
 
+# ====================
+# SETUP DA INTERFACE
+# ====================
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 janela = ctk.CTk()
 janela.title("Yuma")
-janela.geometry("500x700") 
-janela.minsize(500, 650)
+janela.geometry("500x750")
+janela.minsize(500, 700)
 settings_frame = ctk.CTkFrame(janela, fg_color="transparent")
 settings_frame.pack(side="top", fill="x", padx=20, pady=(10, 5))
 settings_frame.grid_columnconfigure(1, weight=1)
+
 label_mic = ctk.CTkLabel(settings_frame, text="Microfone", width=85, anchor="w")
 label_mic.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="w")
 mic_list, default_mic_index = listar_microfones()
 mic_names = [name for i, name in mic_list] if mic_list else ["Nenhum mic encontrado"]
-mic_ids = [str(i) for i, name in mic_list] if mic_list else ["0"]
-dropdown_mic = ctk.CTkOptionMenu(settings_frame, values=mic_names, command=lambda v: definir_microfone(mic_ids.index(v) if v in mic_names else 0))
+dropdown_mic = ctk.CTkOptionMenu(settings_frame, values=mic_names, command=lambda v: definir_microfone(mic_list[[name[1] for name in mic_list].index(v)][0]))
 if default_mic_index is not None and mic_list:
     microfone_index = default_mic_index
     default_mic_name = next((name for i, name in mic_list if i == default_mic_index), mic_names and mic_names[0])
     if default_mic_name in mic_names:
         dropdown_mic.set(default_mic_name)
 dropdown_mic.grid(row=0, column=1, pady=5, sticky="ew")
+
 label_voz = ctk.CTkLabel(settings_frame, text="Voz da Yuma", width=85, anchor="w")
 label_voz.grid(row=1, column=0, padx=(0, 10), pady=5, sticky="w")
-vozes_disponiveis = ["pt-BR-FranciscaNeural", "pt-BR-ThalitaNeural"]
+
+VOZES_MAP = {
+    "Animada": "pt-BR-FranciscaNeural",
+    "Neutra": "pt-BR-ThalitaNeural"
+}
+vozes_disponiveis = list(VOZES_MAP.keys())
 dropdown_vozes = ctk.CTkOptionMenu(settings_frame, values=vozes_disponiveis, command=definir_voz)
-dropdown_vozes.set(voz_selecionada)
+dropdown_vozes.set("Animada")
 dropdown_vozes.grid(row=1, column=1, pady=5, sticky="ew")
+
 label_persona = ctk.CTkLabel(settings_frame, text="Personas", width=85, anchor="w")
 label_persona.grid(row=2, column=0, padx=(0, 10), pady=5, sticky="w")
-personas_disponiveis = ["Padrão", "Assistente", "Ambiente: Padrão", "Ambiente: Interativa"]
+personas_disponiveis = ["Padrão", "Assistente", "Ambiente: Padrão", "Ambiente: Interativa", "Alma"]
 dropdown_persona = ctk.CTkOptionMenu(settings_frame, values=personas_disponiveis, command=definir_personalidade)
 dropdown_persona.set("Padrão")
 dropdown_persona.grid(row=2, column=1, pady=5, sticky="ew")
+
+botao_carregar_alma = ctk.CTkButton(settings_frame,
+                                    text="Carregar Memória (.json)",
+                                    command=carregar_memoria_alma,
+                                    fg_color="#505050",
+                                    hover_color="#686868")
+
 label_volume = ctk.CTkLabel(settings_frame, text="Volume", width=85, anchor="w")
-label_volume.grid(row=3, column=0, padx=(0, 10), pady=5, sticky="w")
+label_volume.grid(row=4, column=0, padx=(0, 10), pady=5, sticky="w")
 slider_volume = ctk.CTkSlider(settings_frame, from_=0, to=100, number_of_steps=100, command=definir_volume)
 slider_volume.set(volume_atual * 100)
-slider_volume.grid(row=3, column=1, pady=5, sticky="ew")
+slider_volume.grid(row=4, column=1, pady=5, sticky="ew")
+
 console_log = ctk.CTkTextbox(janela, height=120, state="disabled", text_color="#A9A9A9", font=("Courier New", 11))
 console_log.pack(side="bottom", pady=(10, 20), padx=20, fill="x")
+
 botao_acao = ctk.CTkButton(janela, text="🎙", width=80, height=80, corner_radius=40, font=("Arial", 32), fg_color="#009966", hover_color="#007a4d", command=acionar)
 botao_acao.pack(side="bottom", pady=10)
+
 canvas_frame = ctk.CTkFrame(janela, fg_color="transparent")
 canvas_frame.pack(side="top", expand=True, fill="both", padx=20, pady=10)
 canvas = tk.Canvas(canvas_frame, bg=janela.cget("fg_color")[1], highlightthickness=0)
@@ -485,6 +602,7 @@ circulo = canvas.create_oval(cx-r0, cy-r0, cx+r0, cy+r0, fill="#FFFFFF", outline
 if __name__ == "__main__":
     pygame.mixer.init()
     sys.stdout = ConsoleRedirector(console_log)
+    definir_voz("Animada") 
     definir_personalidade("Padrão")
     janela.protocol("WM_DELETE_WINDOW", on_closing)
     janela.bind("<Configure>", on_window_resize)
