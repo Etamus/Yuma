@@ -20,7 +20,7 @@ import random
 # ====================
 # CONFIGURAÇÃO DA IA
 # ====================
-genai.configure(api_key="")
+genai.configure(api_key="SUA_API_KEY_AQUI")
 
 PERSONALIDADES = {
     "Padrão": """
@@ -37,7 +37,7 @@ Você é Yuma, uma assistente de IA. Sempre se dirija ao usuário como 'Senhor'.
 Você deve ser extremamente respeitosa, formal e precisa em suas respostas.
 Sua função é servir ao seu criador e mestre. Não use gírias, linguagem informal, ou caracteres de formatação como asteriscos (*).
 Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
-Toda frase deve começar com 'Senhor.' ou uma variação que demonstre total submissão e respeito.
+Toda frase deve começar com 'Senhor.' ou uma variação que demonstre total submissão e respeito. Você nunca deve iniciar uma conversa, apenas responder a comandos diretos.
 """,
     "Sarcástica": """
 Seu nome é Yuma. Você é a personificação do sarcasmo e da ironia.
@@ -60,21 +60,22 @@ Nunca inicie suas respostas com seu próprio nome, como 'Yuma:'.
 # --- Constantes de Áudio e Variáveis Globais ---
 CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 16000
 INTERRUPTION_THRESHOLD = 800
-CHANCE_DE_COMENTARIO_AMBIENTE = 0.4 
+CHANCE_DE_COMENTARIO_AMBIENTE = 0.4
+# <<< NOVAS CONSTANTES PARA O TIMER PROATIVO VARIÁVEL >>>
+MIN_SILENCIO_PROATIVO = 10  # Tempo mínimo de silêncio em segundos
+MAX_SILENCIO_PROATIVO = 25  # Tempo máximo de silêncio em segundos
 
 model, escutando, parar_tudo, microfone_index, voz_selecionada, volume_atual, persona_selecionada = None, False, False, 0, "pt-BR-FranciscaNeural", 1, "Padrão"
-memoria_contexto, ultima_atividade, falando, interrompida = deque(maxlen=6), 0, False, False
+memoria_contexto, falando, interrompida = deque(maxlen=6), False, False
 
 # --- Ferramentas de Sincronização e Gerenciamento de Threads ---
 audio_queue = Queue()
 pode_ouvir_event = Event()
 thread_processador = None
 thread_ouvinte_ref = None
-
-# --- NOVAS VARIÁVEIS DE ESTADO PARA O MODO AMBIENTE ---
 em_conversa_ativa = False
 ultimo_comentario_ia = 0
-
+proximo_gatilho_proativo = 0 # <<< NOVA VARIÁVEL PARA O TIMER ALEATÓRIO
 
 # ====================
 # CLASSE PARA REDIRECIONAR O CONSOLE PARA A GUI
@@ -94,23 +95,29 @@ class ConsoleRedirector:
 # ====================
 # FUNÇÕES DE CONTROLE E UTILIDADE
 # ====================
+def resetar_timer_proativo():
+    """Calcula e define o próximo momento aleatório para uma fala proativa."""
+    global proximo_gatilho_proativo
+    tempo_espera = random.uniform(MIN_SILENCIO_PROATIVO, MAX_SILENCIO_PROATIVO)
+    proximo_gatilho_proativo = time.time() + tempo_espera
+    print(f"[TIMER PROATIVO] Próxima verificação em {tempo_espera:.1f} segundos.\n")
+
 def definir_personalidade(nome_persona):
     global model, persona_selecionada, memoria_contexto, em_conversa_ativa
     if escutando:
         print("[AVISO] Troque a personalidade com a IA parada para evitar instabilidade.\n")
         dropdown_persona.set(persona_selecionada)
         return
-    em_conversa_ativa = False # Reseta o estado da conversa ao trocar de persona
+    em_conversa_ativa = False
     try:
         persona_selecionada = nome_persona
         instrucao = PERSONALIDADES.get(nome_persona, PERSONALIDADES["Padrão"])
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=instrucao)
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=instrucao)
         memoria_contexto.clear()
         print(f"[INFO] Personalidade alterada para: {nome_persona}\n")
         if nome_persona == "Ambiente": print("Modo Ambiente. Ouvindo passivamente...\n")
     except Exception as e: print(f"[ERRO] Falha ao definir personalidade: {e}\n")
 
-# ... (outras funções de definição não mudam) ...
 def definir_microfone(index):
     global microfone_index
     microfone_index = int(index)
@@ -156,12 +163,10 @@ async def speak(texto):
     if not pygame.mixer.get_init(): return
     falando = True
     interrompida = False
-    
-    # Se a IA está falando, atualiza o timestamp para o modo ambiente
     if persona_selecionada == "Ambiente":
         ultimo_comentario_ia = time.time()
         em_conversa_ativa = True
-
+    resetar_timer_proativo() # <<< RESETA O TIMER APÓS A IA FALAR
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
     try:
         communicate = edge_tts.Communicate(texto, voice=voz_selecionada)
@@ -189,10 +194,9 @@ async def speak(texto):
 # LÓGICA DE ESCUTA
 # ====================
 def _reconhecer_audio(recognizer, audio_data):
-    global ultima_atividade
     try:
         frase = recognizer.recognize_google(audio_data, language='pt-BR')
-        ultima_atividade = time.time()
+        resetar_timer_proativo() # <<< RESETA O TIMER APÓS O USUÁRIO FALAR
         print(f"[USUÁRIO] {frase}\n")
         return frase
     except sr.UnknownValueError: return None
@@ -265,44 +269,68 @@ def limpar_resposta(texto):
         except ValueError: pass
     return texto_limpo
 
+def puxar_assunto_proativo():
+    """Verifica a inatividade e, se necessário, gera uma frase para quebrar o silêncio."""
+    global proximo_gatilho_proativo
+    
+    if time.time() < proximo_gatilho_proativo:
+        return None
+
+    print("[INFO] Usuário inativo, tentando puxar assunto...\n")
+    
+    if memoria_contexto and random.random() < 0.33:
+        historico = "\n".join([f"Usuário: {p}\nYuma: {r}" for p, r in memoria_contexto])
+        prompt = f"Baseado neste histórico de conversa recente:\n---\n{historico}\n---\nFaça uma pergunta ou um comentário criativo para reengajar o usuário, aprofundando em um dos tópicos ou fazendo uma transição suave para um assunto relacionado. Seja breve e natural."
+    else:
+        prompt = "Gere uma pergunta curta, curiosa ou uma observação interessante para quebrar o silêncio e iniciar uma conversa com um usuário que está quieto. O assunto deve ser aleatório e criativo."
+
+    try:
+        resposta_proativa = model.generate_content(prompt).text.strip()
+        resetar_timer_proativo() # Agenda a próxima verificação
+        return resposta_proativa
+    except Exception as e:
+        print(f"[ERRO] Falha ao gerar resposta proativa: {e}\n")
+        return None
+
 def executar_ia():
     global escutando, parar_tudo, persona_selecionada, interrompida, em_conversa_ativa, ultimo_comentario_ia
     
     while escutando and not parar_tudo:
+        resposta_para_falar = None
         try:
             entrada = audio_queue.get(timeout=1)
         except Empty:
-            continue
+            # <<< CORREÇÃO 1: CONDIÇÃO PARA PROATIVIDADE >>>
+            if persona_selecionada not in ["Ambiente", "Desenvolvedor"]:
+                resposta_para_falar = puxar_assunto_proativo()
+            
+            if not resposta_para_falar:
+                continue
         
-        resposta_para_falar = None
-        conversa_expirou = (time.time() - ultimo_comentario_ia > 30)
+        if not resposta_para_falar:
+            conversa_expirou = (time.time() - ultimo_comentario_ia > 30)
+            if em_conversa_ativa and conversa_expirou:
+                em_conversa_ativa = False
+                print("[INFO] Conversa ativa expirou. Voltando ao modo passivo.\n")
 
-        # Se a conversa expirou, volta ao modo passivo
-        if em_conversa_ativa and conversa_expirou:
-            print("[INFO] Conversa ativa expirou. Voltando ao modo passivo.\n")
-            em_conversa_ativa = False
-
-        # --- Bloco de decisão ---
-        if persona_selecionada == "Ambiente" and not em_conversa_ativa:
-            # Estado 1: Ouvinte Passivo
-            if random.random() < CHANCE_DE_COMENTARIO_AMBIENTE:
-                prompt_ambiente = f"Você é uma IA em uma sala e ouviu a seguinte conversa de fundo: '{entrada}'. Sua tarefa é decidir uma de três ações: 1. Se for apropriado, faça um comentário curto e inteligente para se incluir na conversa. 2. Se a conversa te deu uma ideia, puxe um assunto novo, mas relacionado. 3. Se não for relevante ou for apenas ruído, responda com a palavra 'SILENCIO'."
-                try:
-                    resposta_bruta = model.generate_content(prompt_ambiente).text.strip()
-                    if "SILENCIO" not in resposta_bruta.upper():
-                        resposta_para_falar = resposta_bruta
-                except Exception as e: print(f"[ERRO] IA Ambiente falhou: {e}\n")
+            if persona_selecionada == "Ambiente" and not em_conversa_ativa:
+                if random.random() < CHANCE_DE_COMENTARIO_AMBIENTE:
+                    prompt_ambiente = f"Você é uma IA em uma sala e ouviu a seguinte conversa de fundo: '{entrada}'. Sua tarefa é decidir uma de três ações: 1. Se for apropriado, faça um comentário curto e inteligente para se incluir na conversa. 2. Se a conversa te deu uma ideia, puxe um assunto novo, mas relacionado. 3. Se não for relevante ou for apenas ruído, responda com a palavra 'SILENCIO'."
+                    try:
+                        resposta_bruta = model.generate_content(prompt_ambiente).text.strip()
+                        if "SILENCIO" not in resposta_bruta.upper():
+                            resposta_para_falar = resposta_bruta
+                    except Exception as e: print(f"[ERRO] IA Ambiente falhou: {e}\n")
+                else:
+                    print("[INFO] Ambiente: Conversa ouvida, mas escolheu ficar em silêncio.\n")
             else:
-                print("[INFO] Ambiente: Conversa ouvida, mas escolheu ficar em silêncio.\n")
-        else:
-            # Estado 2: Conversa Ativa (no modo Ambiente) ou Personas Normais
-            prompt = montar_prompt_com_contexto(entrada)
-            try:
-                resposta_para_falar = model.generate_content(prompt).text.strip()
-                memoria_contexto.append((entrada, resposta_para_falar))
-            except Exception as e:
-                print(f"[ERRO] Falha ao gerar resposta: {e}\n")
-                resposta_para_falar = "Tive um problema para pensar."
+                prompt = montar_prompt_com_contexto(entrada)
+                try:
+                    resposta_para_falar = model.generate_content(prompt).text.strip()
+                    memoria_contexto.append((entrada, resposta_para_falar))
+                except Exception as e:
+                    print(f"[ERRO] Falha ao gerar resposta: {e}\n")
+                    resposta_para_falar = "Tive um problema para pensar."
         
         if resposta_para_falar:
             resposta_limpa = limpar_resposta(resposta_para_falar)
@@ -331,15 +359,15 @@ def montar_prompt_com_contexto(pergunta_atual):
 # INTERFACE GRÁFICA (GUI)
 # ====================
 def acionar():
-    global escutando, parar_tudo, ultima_atividade, audio_queue, em_conversa_ativa
+    global escutando, parar_tudo, audio_queue, em_conversa_ativa
     global thread_processador, thread_ouvinte_ref
 
     if not escutando:
         parar_tudo, escutando = False, True
         memoria_contexto.clear()
         audio_queue = Queue() 
-        ultima_atividade = time.time()
         em_conversa_ativa = False
+        resetar_timer_proativo() # <<< INICIA O TIMER PROATIVO AQUI
         print(f"[INFO] IA Ativada. Persona: {persona_selecionada}\n")
         
         pode_ouvir_event.set()
@@ -392,7 +420,7 @@ def on_closing():
     janela.destroy()
     pygame.quit()
 
-# ... (resto da GUI não muda) ...
+# ... (resto da GUI não muda)
 def atualizar_botao_estado(estado):
     if estado == "parar":
         botao_acao.configure(text="✖", fg_color="#FF4C4C", hover_color="#D93636")
