@@ -1,4 +1,4 @@
 *.phyton linguist-detectable=true  
 *.html linguist-detectable=false  
 
-*.toc linguist-vendored
+build/Yuma/* linguist-vendored
