@@ -1,4 +1,4 @@
 *.phyton linguist-detectable=true  
 *.html linguist-detectable=false  
 
-*.tex linguist-vendored
+*.toc linguist-vendored
