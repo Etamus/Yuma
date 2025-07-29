@@ -1,4 +1,4 @@
-# Yuma
+# 🎙️ Yuma
 IA com interface moderna em Python (CustomTkinter), respostas por voz, personalidade customizável e memória a longo prazo.
 
 ## 🔧 Funcionalidades
