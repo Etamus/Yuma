@@ -49,26 +49,26 @@ IA com interface moderna em Python (CustomTkinter), respostas por voz, personali
 
 ---
 
-## 🆕 Atualizações Recentes
+## Atualizações Recentes
 
-### 📌 Persona "Alma"
+### Persona "Alma"
 - Comportamento carregado dinamicamente via `.json`.
 - Memória persistente com resumo da conversa salvo entre sessões.
 - Botão “Carregar Memória” aparece apenas quando Alma é selecionada.
 
-### 💡 Melhorias de UX/UI
+### Melhorias de UX/UI
 - Elementos reestilizados e mais intuitivos.
 - Botões desativados automaticamente em estados inválidos.
 - Console limpo e sem mensagens desnecessárias.
 
-### 🧱 Correções de Bugs Críticos
+### Correções de Bugs Críticos
 - Duplicação de respostas e voz eliminada.
 - Crash em sobreposição de fala proativa resolvido.
 - Verificação inicial de microfone evita erros de execução.
 
 ---
 
-## 📦 Requisitos
+## Requisitos
 
 - Python 3.10+
 - `customtkinter`
